@@ -1,0 +1,346 @@
+name: CMake+Conan CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # --- базовые настройки ---
+      runner_labels_json:
+        description: 'JSON-массив меток раннера'
+        required: false
+        default: '["self-hosted","Linux","X64"]'
+      cmake_build_type:
+        description: 'CMAKE_BUILD_TYPE для x86'
+        required: false
+        default: 'Release'
+      conan_remote_name:
+        description: 'Имя Conan remote'
+        required: false
+        default: 'insitech'
+      default_app_version:
+        description: 'Версия по умолчанию, если semantic-release не дал версию'
+        required: false
+        default: '0.0.0-${{ github.ref_name }}.${{ github.sha }}'
+      pkg_name:
+        description: 'Имя Conan пакета (для upload)'
+        required: true
+        type: string
+
+      # --- флаги выполнения стадий ---
+      do_build_target:
+        description: 'Собирать target (ARM и т.п.)'
+        required: false
+        default: true
+        type: boolean
+      do_tests:
+        description: 'Запускать ctest'
+        required: false
+        default: true
+        type: boolean
+      do_coverage:
+        description: 'Считать покрытие (lcov/gcovr)'
+        required: false
+        default: true
+        type: boolean
+      do_conan_publish:
+        description: 'Публиковать пакет в Conan'
+        required: false
+        default: false
+        type: boolean
+      do_semantic_release:
+        description: 'Выполнять реальный semantic-release'
+        required: false
+        default: false
+        type: boolean
+
+      # --- доп. флаги билда, можно переопределять в вызывающем репо ---
+      extra_cmake_flags_x86:
+        required: false
+        default: ''
+      extra_cmake_flags_arm:
+        required: false
+        default: ''
+      extra_build_flags_x86:
+        required: false
+        default: ''
+      extra_build_flags_arm:
+        required: false
+        default: ''
+
+    secrets:
+      CONAN_REMOTE_URL:
+        required: true
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+
+env:
+  BUILD_DIR_X86: build_x86
+  BUILD_DIR_TARGET: build_target
+  NPM_CONFIG_FUND: "false"
+  NPM_CONFIG_AUDIT: "false"
+
+jobs:
+  check_env_vars:
+    name: "Prepare tools & Conan"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: "Install base tools (apt)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ make lcov gcovr python3-pip
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user conan
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          conan --version || true
+
+      - name: "Validate required secrets"
+        run: |
+          missing=()
+          [ -n "${{ secrets.NEXUS_PASS }}" ] || missing+=("NEXUS_PASS")
+          [ -n "${{ secrets.NEXUS_USER }}" ] || missing+=("NEXUS_USER")
+          [ -n "${{ secrets.CONAN_REMOTE_URL }}" ] || missing+=("CONAN_REMOTE_URL")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "❌ Missing secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "✅ Secrets present."
+
+      - name: "Conan profile & remotes"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          CONAN_REMOTE_NAME: ${{ inputs.conan_remote_name }}
+          CONAN_REMOTE_URL: ${{ secrets.CONAN_REMOTE_URL }}
+        run: |
+          conan profile detect --force || true
+          if conan remote list | grep -qE "^${CONAN_REMOTE_NAME}\s*:"; then
+            conan remote update "${CONAN_REMOTE_NAME}" --url "${CONAN_REMOTE_URL}" || true
+          else
+            conan remote add "${CONAN_REMOTE_NAME}" "${CONAN_REMOTE_URL}" --force
+          fi
+          conan remote enable "${CONAN_REMOTE_NAME}" || true
+          conan remote login "${CONAN_REMOTE_NAME}" "${NEXUS_USER}" -p "${NEXUS_PASS}"
+          conan remote list
+
+  compute_version:
+    name: "Compute version (semantic-release dry-run)"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [check_env_vars]
+    outputs:
+      VERSION: ${{ steps.out.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: "npm ci"
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --prefer-offline
+          else
+            npm i --no-audit --no-fund --prefer-offline
+          fi
+
+      - name: "semantic-release --dry-run"
+        id: sr
+        run: |
+          npx semantic-release --dry-run --no-ci 2>&1 | tee sr.log || true
+
+      - name: "extract VERSION"
+        id: out
+        run: |
+          VERSION=$(grep -Po '(?<=The next release version is )([0-9]+(\.[0-9]+){2}(?:-[0-9A-Za-z\.-]+)?)' sr.log || true)
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ inputs.default_app_version }}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build_x86:
+    name: "Build x86"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [check_env_vars, compute_version]
+    env:
+      PROJECT_SEMVER: ${{ needs.compute_version.outputs.VERSION }}
+      SOFTWARE_VERSION: ${{ needs.compute_version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: "Conan install (if conanfile exists)"
+        run: |
+          if ls conanfile.* >/dev/null 2>&1; then
+            conan install . -of $BUILD_DIR_X86 -b missing
+          fi
+
+      - name: "Configure (CMake, coverage ON)"
+        run: |
+          cmake -S . -B $BUILD_DIR_X86 -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ inputs.cmake_build_type }}" \
+            -DPROJECT_SEMVER="${PROJECT_SEMVER}" \
+            -DSOFTWARE_VERSION="${SOFTWARE_VERSION}" \
+            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_C_FLAGS="--coverage" \
+            -DBUILD_TESTING=ON \
+            -DSOFTWARE_COVERAGE=ON \
+            ${{ inputs.extra_cmake_flags_x86 }}
+
+      - name: "Build"
+        run: cmake --build $BUILD_DIR_X86 -- -j"$(nproc)" ${{ inputs.extra_build_flags_x86 }}
+
+      - name: "Upload build_x86 artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_x86
+          path: ${{ env.BUILD_DIR_X86 }}/
+
+  target_build:
+    if: ${{ inputs.do_build_target }}
+    name: "Build target"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [check_env_vars, compute_version]
+    env:
+      PROJECT_SEMVER: ${{ needs.compute_version.outputs.VERSION }}
+      SOFTWARE_VERSION: ${{ needs.compute_version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: "Conan install (if conanfile exists)"
+        run: |
+          if ls conanfile.* >/dev/null 2>&1; then
+            conan install . -of $BUILD_DIR_TARGET -b missing
+          fi
+
+      - name: "Configure (CMake target)"
+        run: |
+          cmake -S . -B $BUILD_DIR_TARGET -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPROJECT_SEMVER="${PROJECT_SEMVER}" \
+            -DSOFTWARE_VERSION="${SOFTWARE_VERSION}" \
+            -DBUILD_FOR_TARGET=ON \
+            -DBUILD_TESTING=OFF \
+            -DSOFTWARE_COVERAGE=OFF \
+            ${{ inputs.extra_cmake_flags_arm }}
+
+      - name: "Build"
+        run: cmake --build $BUILD_DIR_TARGET -- -j"$(nproc)" ${{ inputs.extra_build_flags_arm }}
+
+      - name: "Upload build_target artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_target
+          path: ${{ env.BUILD_DIR_TARGET }}/
+
+  test:
+    if: ${{ inputs.do_tests }}
+    name: "Tests"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [build_x86]
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Download build_x86"
+        uses: actions/download-artifact@v4
+        with:
+          name: build_x86
+          path: ${{ env.BUILD_DIR_X86 }}
+      - name: "Run ctest"
+        run: |
+          ctest --test-dir $BUILD_DIR_X86 --output-on-failure --no-tests=error -j"$(nproc)" --output-junit junit.xml
+      - name: "Upload JUnit"
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: ${{ env.BUILD_DIR_X86 }}/junit.xml
+
+  coverage:
+    if: ${{ inputs.do_coverage }}
+    name: "Coverage"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Download build_x86"
+        uses: actions/download-artifact@v4
+        with:
+          name: build_x86
+          path: ${{ env.BUILD_DIR_X86 }}
+      - name: "Collect coverage"
+        run: |
+          cd $BUILD_DIR_X86
+          lcov --capture --directory . --output-file coverage.info --ignore-errors inconsistent --rc geninfo_unexecuted_blocks=1
+          lcov --remove coverage.info '/usr/*' --output-file coverage.info
+          lcov --list coverage.info || true
+          gcovr -r .. --xml-pretty --cobertura-pretty -o coverage.xml
+          gcovr -r .. --html --html-details -o coverage.html
+          gcovr -r .. --txt --print-summary | tee coverage.txt
+      - name: "Upload coverage artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            ${{ env.BUILD_DIR_X86 }}/coverage.html
+            ${{ env.BUILD_DIR_X86 }}/coverage.xml
+            ${{ env.BUILD_DIR_X86 }}/coverage.txt
+
+  conan_publish:
+    if: ${{ inputs.do_conan_publish }}
+    name: "Conan publish"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [check_env_vars, compute_version]
+    env:
+      VERSION: ${{ needs.compute_version.outputs.VERSION }}
+      CONAN_REMOTE_NAME: ${{ inputs.conan_remote_name }}
+      CONAN_REMOTE_URL: ${{ secrets.CONAN_REMOTE_URL }}
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      PKG_NAME: ${{ inputs.pkg_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Ensure profile & create package"
+        run: |
+          conan profile detect --force || true
+          conan profile update settings.build_type="${{ inputs.cmake_build_type }}" default || true
+          if [ -z "${PKG_NAME}" ]; then
+            echo "❌ PKG_NAME is empty."
+            exit 1
+          fi
+          echo "📦 Creating ${PKG_NAME}/${VERSION}"
+          conan create . --version="${VERSION}" -s:h build_type="${{ inputs.cmake_build_type }}"
+      - name: "Upload to remote"
+        run: |
+          echo "➡️ Uploading ${PKG_NAME}/${VERSION} to ${CONAN_REMOTE_NAME}"
+          conan upload "${PKG_NAME}/${VERSION}" -r "${CONAN_REMOTE_NAME}" --confirm --check
+
+  semantic_release_real:
+    if: ${{ inputs.do_semantic_release }}
+    name: "semantic-release (real)"
+    runs-on: ${{ fromJSON(inputs.runner_labels_json) }}
+    needs: [compute_version]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: "npm ci"
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --prefer-offline
+          else
+            npm i --no-audit --no-fund --prefer-offline
+          fi
+      - name: "semantic-release"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release --no-ci
